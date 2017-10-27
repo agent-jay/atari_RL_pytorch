@@ -6,28 +6,46 @@ from torch.autograd import Variable
 import torchvision.transforms as T
 
 import gym
-import itertools
 import numpy as np
 import os
 import random
 import sys
-import copy
+import argparse
+
+import plots
+from collections import namedtuple
+
+parser = argparse.ArgumentParser(description='DQN Configuration')
+parser.add_argument('--model', default='dqn', type=str, help='Model name, prefix of saved file')
+parser.add_argument('--use_cpu',  action='store_true', help='Use CPU instead of default GPU for training')
+parser.add_argument('--load_latest',  action='store_true', help='load latest checkpoint')
+parser.add_argument('--debug',  action='store_true', help='Debug mode- save qvalues')
+parser.add_argument('--clip', action='store_true', help='clipping the delta between -1 and 1')
+parser.add_argument('--skip_frames', action='store_true', help='Skip 4 frames')
+parser.add_argument('--num_episodes', default=10000, type= int, help="Number of training episodes")
+parser.add_argument('--replay_memory_size', default=500000, type= int, help="Max capacity of replay memory")
+parser.add_argument('--replay_memory_init_size', default=100000, type= int, help="Number of states to populate replay memory with during initialization")
+parser.add_argument('--update_target_estimator_every', default=10000, type= int, help="Update target network every _ steps")
+parser.add_argument('--save_qnetwork_every', default=50, type= int, help="Save QNetwork weights every _ episodes")
+parser.add_argument('--epsilon_start', default=1.0, type= float, help="Initial epsilon") 
+parser.add_argument('--epsilon_end', default=0.1, type= float, help="Epsilon at end of annealing")
+parser.add_argument('--epsilon_decay_steps', default=500000, type= int, help="Epsilon decay schedule length")
+parser.add_argument('--discount_factor', default= .99, type= float, help="Discount factor for MDP") 
+parser.add_argument('--batch_size', default=128, type= int, help="Batch size for CNN training")
+args= parser.parse_args()
+print(args)
 
 if "../" not in sys.path:
   sys.path.append("../")
 
-import plots
-from collections import deque, namedtuple
-
-import matplotlib.pyplot as plt
-from IPython import display
-from matplotlib import pylab as pl
-
-
-
 # if gpu is to be used
-use_cuda = True
-#use_cuda= torch.cuda.is_available()
+use_cuda= False
+if torch.cuda.is_available() and args.use_cpu==False:
+    use_cuda=True
+    print("Using GPU")
+else:
+    print("Using CPU")
+
 FloatTensor = torch.cuda.FloatTensor if use_cuda else torch.FloatTensor
 LongTensor = torch.cuda.LongTensor if use_cuda else torch.LongTensor
 ByteTensor = torch.cuda.ByteTensor if use_cuda else torch.ByteTensor
@@ -118,11 +136,12 @@ class QNetwork(nn.Module):
         
         # Three convolutional layers
         self.conv1= nn.Conv2d(in_frames,32,8,4) 
-        self.bn1 = nn.BatchNorm2d(32)
         self.conv2= nn.Conv2d(32,64,4,2)
-        self.bn2 = nn.BatchNorm2d(64)
         self.conv3= nn.Conv2d(64,64,3,1)
-        self.bn3 = nn.BatchNorm2d(64)
+        # Batch norm is supposedly not helpful 
+        # self.bn1 = nn.BatchNorm2d(32)
+        # self.bn2 = nn.BatchNorm2d(64)
+        # self.bn3 = nn.BatchNorm2d(64)
         # Fully connected layer
         self.fc1= nn.Linear(64*7*7,1500)
         self.fc2= nn.Linear(1500,n_actions)
@@ -140,24 +159,25 @@ class QNetwork(nn.Module):
           action values.
         """
         #h= x/255. #normalizing data
-        h= F.relu(self.bn1(self.conv1(x)))
-        h= F.relu(self.bn2(self.conv2(h)))
-        h= F.relu(self.bn3(self.conv3(h)))
-        #h= F.relu(self.conv1(x))
-        #h= F.relu(self.conv2(h))
-        #h= F.relu(self.conv3(h))
+        h= F.relu(self.conv1(x))
+        h= F.relu(self.conv2(h))
+        h= F.relu(self.conv3(h))
+        # h= F.relu(self.bn1(self.conv1(x)))
+        # h= F.relu(self.bn2(self.conv2(h)))
+        # h= F.relu(self.bn3(self.conv3(h)))
         h=h.view(x.size(0), -1)
         h= F.relu(self.fc1(h))
         h= self.fc2(h)
         return h
      
-def make_epsilon_greedy_policy(estimator, nA):
+def make_epsilon_greedy_policy(estimator, nA, use_cuda=True):
     """
     Creates an epsilon-greedy policy based on a given Q-function approximator and epsilon.
 
     Args:
         estimator: An estimator that returns q values for a given state
         nA: Number of actions in the environment.
+        use_cuda: Use GPU or not. Currently unused
 
     Returns:
         A function that takes the (sess, observation, epsilon) as an argument and returns
@@ -187,7 +207,7 @@ def copy_model_parameters(estimator1, estimator2):
 Transition = namedtuple("Transition", ["state", "action", "reward", "next_state", "done"])
 
 class ReplayMemory(object):
-    def __init__(self, size=10000):
+    def __init__(self, size):
         super(ReplayMemory,self).__init__()
         self.memory= []
         self.cur_size=0
@@ -206,26 +226,33 @@ class ReplayMemory(object):
     def __len__(self):
         return self.cur_size
     
-def save_checkpoint(state, filename='dqn_chkpt.pth'):
+def save_checkpoint(state, filename):
     torch.save(state, filename)
     print(f"=> saving checkpoint '{filename}' at episode {state['epoch']}")
 
         
-def load_checkpoint(state,filename='dqn_chkpt.pth'):
+def load_checkpoint(filename):
+    """
+    state: is a dictionary with initialized 'q_estimator' and 'optimizer' keys
+    filename: location of file
+
+    """
     if os.path.isfile(filename):
+        state={}
         print(f"=> loading checkpoint '{filename}'")
-        checkpoint = torch.load(filename)
-        i_episode = checkpoint['epoch']
-        state['q_estimator'].load_state_dict(checkpoint['state_dict'])
-        state['optimizer'].load_state_dict(checkpoint['optimizer'])
-        print(f"=> loaded checkpoint at {filename}, epoch {i_episode}")
-        return i_episode
+        state = torch.load(filename)
+        if state:
+            print(f"=> loaded checkpoint at {filename}")
+            return state
+        else:
+            print("Loading failed!!")
+            return None
     else:
         print(f"=> no checkpoint found at {filename}")
-        return 0
+        return None
 
 
-def optimize(batch_size, replay_memory,q_estimator, target_estimator, optimizer, discount_factor, grad_clip=True):
+def optimize(batch_size, replay_memory,q_estimator, target_estimator, optimizer, discount_factor, grad_clip=False):
 
     batch = Transition(*zip(*replay_memory.sample(batch_size)))
 
@@ -275,35 +302,52 @@ def optimize(batch_size, replay_memory,q_estimator, target_estimator, optimizer,
     return loss.cpu().data.numpy()[0]
 
 
-q_values=[]
-# Keeps track of useful statistics
-episode_lengths=np.zeros(10000)
-episode_rewards=np.zeros(10000)
-
 
 def main():
-    global q_values
-    #Initalizing and filling up replay memory
+    model_name= args.model
+    num_episodes= args.num_episodes
+    replay_memory_size=args.replay_memory_size
+    replay_memory_init_size=args.replay_memory_init_size
+    update_target_estimator_every=args.update_target_estimator_every
+    save_qnetwork_every=args.save_qnetwork_every
+    epsilon_start=args.epsilon_start
+    epsilon_end=args.epsilon_end
+    epsilon_decay_steps=args.epsilon_decay_steps
+    discount_factor=args.discount_factor
+    batch_size=args.batch_size
+    grad_clip= args.clip
+    debug= args.debug
+    skip_frames= args.skip_frames
 
-    num_episodes=10000
-    replay_memory_size=500000
-    replay_memory_init_size=10000
-    update_target_estimator_every=3500
-    save_qnetwork_every=50
-    epsilon_start=1.0
-    epsilon_end=0.1
-    epsilon_decay_steps=500000
-    discount_factor= .99
-    batch_size=32
 
     q_estimator= QNetwork()
     target_estimator= QNetwork()
-    q_estimator.cuda()
-    target_estimator.cuda()
+    if use_cuda:
+        q_estimator.cuda()
+        target_estimator.cuda()
     optimizer= torch.optim.RMSprop(q_estimator.parameters(),lr=0.00025, momentum=0, weight_decay=0.99, eps=1e-6)
 
-    state= {'q_estimator':q_estimator, 'optimizer':optimizer}
-    start_episode=load_checkpoint(state)
+    start_episode=0
+    state={}
+    if args.load_latest:
+        checkpoint=load_checkpoint(model_name+'_chkpt.pth')
+
+    total_t=0 #indexes episode,step
+    start_episode=0
+
+    # Keeps track of useful statistics
+    q_values=[]
+    episode_lengths=np.zeros(10000)
+    episode_rewards=np.zeros(10000)
+
+    if checkpoint:
+        start_episode= checkpoint['epoch']
+        episode_lengths= checkpoint['episode_lengths']
+        episode_rewards = checkpoint['episode_rewards']
+        total_t= checkpoint['total_t']
+        q_estimator.load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        print(f"Starting at episode {start_episode}, global step:{total_t}")
 
     copy_model_parameters(q_estimator,target_estimator) #Initializing them to same values
 
@@ -315,21 +359,17 @@ def main():
     # The policy we're following
     policy = make_epsilon_greedy_policy(q_estimator,nA)
 
-
     # Populate the replay memory with initial experience
-    print("Populating replay memory with intial experience")
     env = gym.envs.make("Breakout-v0")
     state = env.reset() 
     state= process(state) 
     state=torch.cat([state.clone() for i in range(4)]) 
-    #It is possible that more efficient way of storing states is as numpy arrays
-    #Watch out for GPU memory blowups since replay memory is all GPU memory
     state=state.unsqueeze(0) #Dim is 1*4*84*84
 
+    print("Populating replay memory with intial experience")
     for i in range(replay_memory_init_size):
         # make random actions and observe action sequences
         a_probs= policy(Variable(state,volatile=True).cuda(), 1)
-        #print a_probs. I want to see if it's working correctly
         action = random.choices(VALID_ACTIONS, weights=a_probs)[0]
         new_state,reward,done,_= env.step(action)
         #if done:
@@ -350,7 +390,6 @@ def main():
 
 
     print("Training")
-    total_t=0 #indexes episode,step
     for i_episode in range(start_episode,num_episodes):
 
         # Reset the environment
@@ -359,56 +398,68 @@ def main():
         state=torch.cat([state.clone() for i in range(4)]) 
         state=state.unsqueeze(0)
 
+        k=4 # Used to decide number of frames skipped
+        action=None
         loss = None
         done=False
-        #k=4
-        action=None
 
         if i_episode>start_episode and i_episode % save_qnetwork_every == 0:
             save_checkpoint({'epoch': i_episode + 1,
+                             'total_t':total_t,
                              'state_dict': q_estimator.state_dict(),
-                             'optimizer' : optimizer.state_dict()
-                            })
+                             'optimizer' : optimizer.state_dict(),
+                             'episode_lengths':episode_lengths,
+                             'episode_rewards':episode_rewards,
+                            }, model_name+'_chkpt.pth')
         while not done:
-            #if action is not None and total_t%k==0:
-            #    _,_,done,_= env.step(action)
-            #    total_t+=1
-            #    continue
-
-            # Epsilon for this time step
-            epsilon = epsilons[min(total_t, epsilon_decay_steps-1)]
+            if skip_frames and action is not None:
+               _,_,done,_= env.step(action)
+               _,_,done,_= env.step(action)
+               _,_,done,_= env.step(action)
+               _,_,done,_= env.step(action)
 
             # Update the target estimator
             if total_t % update_target_estimator_every == 0:
                 copy_model_parameters(q_estimator,target_estimator)
 
-            # Print out which step we're on, useful for debugging.
-            if total_t%100==0:
-                print(f"""\rStep {episode_lengths[i_episode]} ({total_t}) @ Episode {i_episode+1}/{num_episodes},loss: {loss}, episode_reward: {episode_rewards[i_episode]}, epsilon:{epsilon}""",end="")
-            sys.stdout.flush()
+            # Epsilon for this time step
+            epsilon = epsilons[min(total_t, epsilon_decay_steps-1)]
 
-            #Make epsilon-greedy policy
+             #Make epsilon-greedy policy
             policy= make_epsilon_greedy_policy(q_estimator,nA)
 
+             # Print out which step we're on, useful for debugging.
+            if total_t%100==0:
+                log_str= f"""Episode length: {episode_lengths[i_episode]}%d @ Episode {i_episode+1}/{num_episodes} Step: {total_t}"""
+                log_str+= f""",loss: {loss}, episode_reward: {episode_rewards[i_episode]}, epsilon:{epsilon}"""
+                log_str+=f", Replay memory size {len(replay_memory)}/{replay_memory_size}"
+                print(log_str)
+                sys.stdout.flush() 
+                #Add logger statements here
+
             # Take a step in the environment
-            q_values.append(q_estimator(Variable(state.cuda(),volatile=True)).mean().cpu().data.numpy())
+            if debug:
+                q_values.append(q_estimator(Variable(state.cuda(),volatile=True)).mean().cpu().data.numpy())
+
             a_probs= policy(Variable(state,volatile=True).cuda(),epsilon)
             action = random.choices(VALID_ACTIONS, weights=a_probs)[0]
             new_state,reward,done,_= env.step(action)
             new_state= process(new_state).unsqueeze(0)
             new_state=torch.cat([state[:,1:,:,:], new_state],dim=1)
 
-            # Save transition to replay memory
+            #Reward shaping. Dangerous
             #if done:
             #    reward= -1
-            reward = max(-1.0, min(reward, 1.0))
+            # Save transition to replay memory
+            reward = max(-1.0, min(reward, 1.0)) #Reward clipping
             replay_memory.push(state,action-1,reward,new_state,done)
         
             # Update statistics
             episode_rewards[i_episode] += reward
             episode_lengths[i_episode] += 1
 
-            loss= optimize(batch_size, replay_memory, q_estimator, q_estimator, optimizer, discount_factor)
+            loss= optimize(batch_size, replay_memory, q_estimator,
+                    target_estimator, optimizer, discount_factor, grad_clip)
 
             state = new_state
             total_t += 1
