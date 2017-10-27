@@ -35,9 +35,6 @@ parser.add_argument('--batch_size', default=128, type= int, help="Batch size for
 args= parser.parse_args()
 print(args)
 
-if "../" not in sys.path:
-  sys.path.append("../")
-
 # if gpu is to be used
 use_cuda= False
 if torch.cuda.is_available() and args.use_cpu==False:
@@ -328,7 +325,7 @@ def main():
     optimizer= torch.optim.RMSprop(q_estimator.parameters(),lr=0.00025, momentum=0, weight_decay=0.99, eps=1e-6)
 
     start_episode=0
-    state={}
+    checkpoint={}
     if args.load_latest:
         checkpoint=load_checkpoint(model_name+'_chkpt.pth')
 

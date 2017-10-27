@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 from collections import namedtuple
 from matplotlib import pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 def plot_episode_stats(episode_lengths, episode_rewards, smoothing_window=10, noshow=False):
     # Plot the episode length over time
